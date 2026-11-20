@@ -1,6 +1,6 @@
 # siegegrell-media
 
-Chart cards for posts on [@SiegeGrell](https://x.com/SiegeGrell), the humanoid-robot scorecard account. Each card is a 1600×900 PNG with a public link, so the scheduler (Postiz) can attach it to an X post.
+Chart cards for posts on [@SiegeGrell](https://x.com/SiegeGrell), the humanoid-robot scorecard account. Each card is a 1200×1200 PNG with a public link, so the scheduler (Postiz) can attach it to an X post.
 
 ![Example number card](examples/number-card.png)
 
@@ -15,7 +15,7 @@ It writes `cards/<date>-<slug>.png` and prints one line of JSON:
 ```json
 {"file": "cards/2026-11-21-gxo-apptronik-loi.png",
  "raw_url": "https://raw.githubusercontent.com/Jikjii/siegegrell-media/main/cards/2026-11-21-gxo-apptronik-loi.png",
- "alt": "Number of the day. 1,000: Apollo humanoids ...", "width": 1600, "height": 900, "bytes": 163117}
+ "alt": "Number of the day. 1,000: Apollo humanoids ...", "width": 1200, "height": 1200, "bytes": 224000}
 ```
 
 `raw_url` works once the file is pushed to `main`. `alt` is ready-made alt text for the post. If a card with the same date and slug exists, the new one gets a `-2` suffix; `--replace` overwrites instead.
@@ -62,4 +62,4 @@ Fields every card needs:
 
 ## Design
 
-Inter (bundled in `fonts/`, SIL Open Font License) on a warm off-white card. Ink colors and the blue come from a colorblind-checked palette; verdicts always show a word and an icon, never color alone. Cards render at 2× and are scaled down, so edges stay smooth.
+Each card is an engineering drawing sheet: a zoned border, a drafting grid, and a title block that holds the source, the date and the handle. A verdict is a rubber inspection stamp, and the word on the stamp always carries the meaning, never the color alone. Type is Barlow (bundled in `fonts/`, SIL Open Font License), a DIN-style grotesk like the lettering on machines; big numbers use its condensed cut. Long number ranges such as "700 to 800" never break across lines. Cards are square so they read large on phones, and they render at 2× and are scaled down so edges stay smooth.
