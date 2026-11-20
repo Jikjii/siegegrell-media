@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Render 1200x1200 chart cards for @SiegeGrell posts on X.
-
-Each card is drawn as an engineering drawing sheet: a zoned border, a drafting
-grid, a title block that holds the source, and a QC inspection stamp for
-verdicts. Type is Barlow, a DIN-style grotesk like the lettering on machines.
+"""Render 1600x900 chart cards for @SiegeGrell posts on X, in light or dark.
 
     python3 -I make_card.py SPEC.json [--outdir cards] [--replace]
 
@@ -15,14 +11,12 @@ or a field is too long to fit. Text is never cut silently.
 
 import argparse
 import datetime as dt
-import hashlib
 import json
 import os
 import re
 import sys
 
-import numpy as np
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FONT_DIR = os.path.join(HERE, "fonts")
@@ -30,53 +24,71 @@ REPO = "Jikjii/siegegrell-media"
 BRANCH = "main"
 HANDLE = "@SiegeGrell"
 
-# Everything is drawn at 2x and scaled down, so lines and stamps stay smooth.
+# Everything is drawn at 2x and scaled down, so shapes are smooth.
 S = 2
-OUT = 1200
-W = H = OUT * S
+OUT_W, OUT_H = 1600, 900
+W, H = OUT_W * S, OUT_H * S
+PAD = 100 * S
+HEADER_BASE = 112 * S
+BODY_TOP = 178 * S
+FOOTER_TOP = 776 * S
+BODY_BOTTOM = FOOTER_TOP - 44 * S
+
+# Colors: the dataviz reference palette. Light mode sits on a warm card surface;
+# dark mode uses the palette's dark steps. set_theme() swaps them before drawing.
+THEMES = {
+    "light": {
+        "SURFACE": "#f5f4ef",
+        "INK": "#0b0b0b",
+        "INK_2": "#52514e",
+        "HAIRLINE": "#dcdbd3",
+        "BASELINE": "#b9b8ae",
+        "BLUE": "#2a78d6",       # categorical slot 1: the bar the story is about
+        "BLUE_SOFT": "#86b6ef",  # blue step 250: the other bars
+        "TINT": 0.18,            # how much verdict color goes into a pill's fill
+    },
+    "dark": {
+        "SURFACE": "#1a1a19",
+        "INK": "#f0efec",
+        "INK_2": "#c3c2b7",
+        "HAIRLINE": "#383835",
+        "BASELINE": "#5a5954",
+        "BLUE": "#3987e5",       # dark step of slot 1
+        "BLUE_SOFT": "#184f95",  # blue step 600: the other bars recede on dark
+        "TINT": 0.26,
+    },
+}
+SURFACE = INK = INK_2 = HAIRLINE = BASELINE = BLUE = BLUE_SOFT = TINT = None
 
 
-def u(v):
-    """Design pixels (at 1200x1200) to render pixels."""
-    return round(v * S)
+def set_theme(name):
+    globals().update(THEMES[name])
 
 
-OUTER = u(26)            # outer border of the sheet
-INNER = u(56)            # inner border; the zone band sits between the two
-X0, X1 = u(100), W - u(100)
-Y0 = u(100)
-TB_H = u(118)            # title block height
-TB_TOP = H - INNER - TB_H
-Y1 = TB_TOP - u(44)      # bottom of the content area
-CONTENT_W = X1 - X0
+set_theme("light")
 
-PAPER = "#fbfcfd"
-GRID_MINOR = "#e9eff4"
-GRID_MAJOR = "#d5e0e9"
-INK = "#16191d"
-INK_2 = "#4a5562"
-INK_3 = "#7d8995"
-RULE = "#c4cfd9"
-BAR_SOFT = "#aeb9c4"
-
-# Verdict stamps. The word always carries the meaning; color backs it up.
+# Status palette. The label always carries the meaning; color and icon back it up.
 VERDICTS = {
-    "proven": ("Proven", "#1d7a3a"),
-    "promising": ("Promising", "#b86e00"),
-    "unproven": ("Unproven", "#4f5d6b"),
-    "false": ("False", "#c1272d"),
+    "proven": ("Proven", "#0ca30c", "#ffffff"),
+    "promising": ("Promising", "#fab219", "#0b0b0b"),
+    "unproven": ("Unproven", "#898781", "#ffffff"),
+    "false": ("False", "#d03b3b", "#ffffff"),
 }
 
 FONT_FILES = {
-    "body": "Barlow-Regular.ttf",
-    "medium": "Barlow-Medium.ttf",
-    "semibold": "Barlow-SemiBold.ttf",
-    "head": "BarlowSemiCondensed-SemiBold.ttf",
-    "headbold": "BarlowSemiCondensed-Bold.ttf",
-    "value": "BarlowCondensed-Bold.ttf",
-    "hero": "BarlowCondensed-ExtraBold.ttf",
+    "regular": "Inter-Regular.otf",
+    "medium": "Inter-Medium.otf",
+    "semibold": "Inter-SemiBold.otf",
+    "bold": "Inter-Bold.otf",
+    "hero": "InterDisplay-SemiBold.otf",
 }
-FALLBACK_FILES = {k: ("DejaVuSans.ttf" if k in ("body", "medium") else "DejaVuSans-Bold.ttf") for k in FONT_FILES}
+FALLBACK_FILES = {
+    "regular": "DejaVuSans.ttf",
+    "medium": "DejaVuSans.ttf",
+    "semibold": "DejaVuSans-Bold.ttf",
+    "bold": "DejaVuSans-Bold.ttf",
+    "hero": "DejaVuSans-Bold.ttf",
+}
 _fonts = {}
 
 
@@ -114,27 +126,10 @@ def draw_tracked(d, x, y, text, f, fill, tracking):
     return x
 
 
-NUM = re.compile(r"[$~]?\d[\d,.]*[%+]?")
-
-
-def tokens(text):
-    """Words, with number ranges such as "700 to 800" kept on one line."""
-    words, out, i = text.split(), [], 0
-    while i < len(words):
-        if i + 2 < len(words) and NUM.fullmatch(words[i]) and words[i + 1] in ("to", "or", "-", "–") \
-                and NUM.match(words[i + 2]):
-            out.append(" ".join(words[i:i + 3]))
-            i += 3
-        else:
-            out.append(words[i])
-            i += 1
-    return out
-
-
 def wrap(text, f, max_w):
     """Greedy word wrap. Returns None if a single word is wider than max_w."""
     lines, cur = [], ""
-    for word in tokens(text):
+    for word in text.split():
         if text_w(word, f) > max_w:
             return None
         trial = f"{cur} {word}".strip()
@@ -148,21 +143,6 @@ def wrap(text, f, max_w):
     return lines
 
 
-def balance(text, f, max_w, lines):
-    """Same number of lines, but as even as possible, so no word is left alone."""
-    if len(lines) < 2:
-        return lines
-    lo, hi, best = max(text_w(w, f) for w in tokens(text)), max_w, lines
-    while hi - lo > S:
-        mid = (lo + hi) / 2
-        trial = wrap(text, f, mid)
-        if trial is not None and len(trial) <= len(lines):
-            best, hi = trial, mid
-        else:
-            lo = mid
-    return best
-
-
 def fit(text, weight, max_w, max_lines, size, min_size):
     """Largest font size (down to min_size) at which text fits; None if it never does."""
     s = size
@@ -170,24 +150,19 @@ def fit(text, weight, max_w, max_lines, size, min_size):
         f = font(weight, s)
         lines = wrap(text, f, max_w)
         if lines is not None and len(lines) <= max_lines:
-            return f, balance(text, f, max_w, lines)
+            return f, lines
         s -= S
     return None
 
 
-def text_block(text, weight, max_w, max_lines, size, min_size, lh_factor):
-    got = fit(text, weight, max_w, max_lines, size, min_size)
-    if not got:
-        return None
-    f, lines = got
-    lh = round(f.size * lh_factor)
-    return {"font": f, "lines": lines, "lh": lh, "cap": cap(f), "height": cap(f) + (len(lines) - 1) * lh}
+def hex_rgb(c):
+    c = c.lstrip("#")
+    return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
 
 
-def draw_block(d, b, x, top, fill):
-    base = top + b["cap"]
-    for i, line in enumerate(b["lines"]):
-        d.text((x, base + i * b["lh"]), line, font=b["font"], fill=fill, anchor="ls")
+def mix(c1, c2, t):
+    a, b = hex_rgb(c1), hex_rgb(c2)
+    return tuple(round(a[i] * t + b[i] * (1 - t)) for i in range(3))
 
 
 # ---------- spec validation ----------
@@ -245,10 +220,19 @@ def validate(spec):
             date = dt.date.fromisoformat(date)
         except (TypeError, ValueError):
             raise SpecError('"date" must be YYYY-MM-DD')
+    theme = spec.get("theme", "auto")
+    if theme == "auto":
+        nth = spec.get("nth", 0)
+        if isinstance(nth, bool) or not isinstance(nth, int) or nth < 0:
+            raise SpecError('"nth" must be 0 or more: the card\'s place among the day\'s cards, counting from 0')
+        theme = ("light", "dark")[(date.toordinal() + nth) % 2]
+    elif theme not in THEMES:
+        raise SpecError('"theme" must be "light", "dark" or "auto"')
     out = {
         "type": kind,
         "slug": slug,
         "date": date,
+        "theme": theme,
         "kicker": req_str(spec, "kicker", 40),
         "source": req_str(spec, "source", 160),
     }
@@ -295,248 +279,236 @@ def validate(spec):
     return out
 
 
-# ---------- the sheet ----------
+# ---------- shared pieces ----------
 
 def date_label(d):
-    return f"{d.strftime('%b')} {d.day}, {d.year}"
+    return f"{d.strftime('%b')} {d.day}, {d.year}".upper()
 
 
-def draw_sheet(d):
-    """Drafting grid, double border and zone markers."""
-    step = u(24)
-    for major in (False, True):
-        for i, x in enumerate(range(INNER, W - INNER + 1, step)):
-            if (i % 5 == 0) == major:
-                d.line([(x, INNER), (x, H - INNER)], fill=GRID_MAJOR if major else GRID_MINOR, width=S if major else 1)
-        for i, y in enumerate(range(INNER, H - INNER + 1, step)):
-            if (i % 5 == 0) == major:
-                d.line([(INNER, y), (W - INNER, y)], fill=GRID_MAJOR if major else GRID_MINOR, width=S if major else 1)
-    d.rectangle([OUTER, OUTER, W - OUTER, H - OUTER], outline=INK, width=u(3))
-    d.rectangle([INNER, INNER, W - INNER, H - INNER], outline=INK, width=u(1.5))
-    zf = font("medium", u(15))
-    span = (W - 2 * INNER) / 4
-    band = (OUTER + INNER) / 2
-    for i in range(4):
-        mid = INNER + span * (i + 0.5)
-        d.text((mid, band), str(i + 1), font=zf, fill=INK_3, anchor="mm")
-        d.text((mid, H - band), str(i + 1), font=zf, fill=INK_3, anchor="mm")
-        d.text((band, mid), "ABCD"[i], font=zf, fill=INK_3, anchor="mm")
-        d.text((W - band, mid), "ABCD"[i], font=zf, fill=INK_3, anchor="mm")
-        if i:
-            b = INNER + span * i
-            for seg in (((b, OUTER), (b, INNER)), ((b, H - INNER), (b, H - OUTER)),
-                        ((OUTER, b), (INNER, b)), ((W - INNER, b), (W - OUTER, b))):
-                d.line(seg, fill=INK, width=u(1.5))
+def source_line(source):
+    return source if source.lower().startswith("source") else f"Source: {source}"
 
 
-def draw_title_block(d, source, date):
-    x0, x1, y0, y1 = INNER, W - INNER, TB_TOP, H - INNER
-    d.rectangle([x0, y0, x1, y1], fill=PAPER)
-    d.line([(x0, y0), (x1, y0)], fill=INK, width=u(1.5))
-    c1 = x0 + (x1 - x0) * 0.60
-    c2 = x0 + (x1 - x0) * 0.79
-    for c in (c1, c2):
-        d.line([(c, y0), (c, y1)], fill=INK, width=u(1.5))
-    pad = u(18)
-    lf = font("medium", u(16))
-    label_base = y0 + u(16) + cap(lf)
-    for x, label in ((x0, "Source"), (c1, "Date"), (c2, "By")):
-        d.text((x + pad, label_base), label, font=lf, fill=INK_3, anchor="ls")
-    top = label_base + u(16)
-    got = fit(source, "semibold", c1 - x0 - 2 * pad, 2, u(25), u(18))
+def draw_header(d, kicker, date):
+    f = font("semibold", 26 * S)
+    tracking = 2.6 * S
+    mark = 18 * S
+    date_txt = date_label(date)
+    dw = tracked_w(date_txt, f, tracking)
+    kick = kicker.upper()
+    room = W - 2 * PAD - mark - 18 * S - dw - 48 * S
+    if tracked_w(kick, f, tracking) > room:
+        raise SpecError('"kicker" is too long to fit in the header; shorten it')
+    d.rounded_rectangle([PAD, HEADER_BASE - mark, PAD + mark, HEADER_BASE], radius=4 * S, fill=BLUE)
+    draw_tracked(d, PAD + mark + 18 * S, HEADER_BASE, kick, f, INK, tracking)
+    draw_tracked(d, W - PAD - dw, HEADER_BASE, date_txt, f, INK_2, tracking)
+
+
+def draw_footer(d, source):
+    d.line([(PAD, FOOTER_TOP), (W - PAD, FOOTER_TOP)], fill=HAIRLINE, width=2 * S)
+    fh = font("semibold", 28 * S)
+    room = W - 2 * PAD - text_w(HANDLE, fh) - 56 * S
+    got = fit(source_line(source), "regular", room, 2, 28 * S, 22 * S)
     if not got:
-        raise SpecError('"source" is too long to fit in the title block; shorten it')
-    vf, lines = got
-    lh = round(vf.size * 1.22)
+        raise SpecError('"source" is too long to fit in two footer lines; shorten it')
+    f, lines = got
+    lh = round(f.size * 1.32)
+    block = cap(f) + (len(lines) - 1) * lh
+    base = FOOTER_TOP + (H - FOOTER_TOP - block) / 2 + cap(f)
     for i, line in enumerate(lines):
-        d.text((x0 + pad, top + cap(vf) + i * lh), line, font=vf, fill=INK, anchor="ls")
-    df = font("semibold", u(25))
-    d.text((c1 + pad, top + cap(df)), date_label(date), font=df, fill=INK, anchor="ls")
-    hf = font("headbold", u(28))
-    d.text((c2 + pad, top + cap(hf)), HANDLE, font=hf, fill=INK, anchor="ls")
+        d.text((PAD, base + i * lh), line, font=f, fill=INK_2, anchor="ls")
+    d.text((W - PAD, base), HANDLE, font=fh, fill=INK, anchor="rs")
 
 
-def draw_kicker(d, kicker, right_limit=X1):
-    f = font("head", u(30))
-    if text_w(kicker, f) > right_limit - X0:
-        raise SpecError('"kicker" is too long to fit; shorten it')
-    base = Y0 + cap(f)
-    d.text((X0, base), kicker, font=f, fill=INK_2, anchor="ls")
-    return base
+def pill_metrics(verdict, k):
+    h = round(60 * S * k)
+    f = font("semibold", 29 * S * k)
+    icon = h - 20 * S * k
+    w = 10 * S * k + icon + 14 * S * k + text_w(VERDICTS[verdict][0], f) + 26 * S * k
+    return round(w), h, f, icon
 
 
-# ---------- the inspection stamp ----------
-
-def seed_for(*parts):
-    return int(hashlib.sha256("|".join(map(str, parts)).encode()).hexdigest()[:8], 16)
-
-
-def make_stamp(verdict, size, angle, seed):
-    """Ink mask of a rotated, double-ruled rubber stamp, plus its color."""
-    word, color = VERDICTS[verdict]
-    word = word.upper()
-    f = font("hero", size)
-    tracking = size * 0.06
-    tw, ch = tracked_w(word, f, tracking), cap(f)
-    t_out, gap, t_in = max(2, round(size * 0.085)), round(size * 0.1), max(1, round(size * 0.035))
-    pad_x, pad_y = size * 0.36, size * 0.3
-    w = round(tw + 2 * (pad_x + gap + t_out))
-    h = round(ch + 2 * (pad_y + gap + t_out))
-    m = Image.new("L", (w, h), 0)
-    md = ImageDraw.Draw(m)
-    md.rounded_rectangle([0, 0, w - 1, h - 1], radius=round(size * 0.12), outline=255, width=t_out)
-    o = t_out + gap
-    md.rectangle([o, o, w - 1 - o, h - 1 - o], outline=255, width=t_in)
-    draw_tracked(md, (w - tw) / 2, h / 2 + ch / 2, word, f, 255, tracking)
-    rng = np.random.default_rng(seed)
-    blot = rng.random((max(2, h // 9), max(2, w // 9)))
-    blot = np.asarray(Image.fromarray((blot * 255).astype("uint8")).resize((w, h), Image.BICUBIC), dtype=np.float32) / 255
-    keep = np.clip((blot - 0.05) / 0.2, 0.0, 1.0) * (rng.random((h, w)) > 0.03)
-    ink = np.asarray(m, dtype=np.float32) / 255 * keep * 0.93
-    mask = Image.fromarray((ink * 255).astype("uint8")).filter(ImageFilter.GaussianBlur(0.5 * S))
-    return mask.rotate(angle, resample=Image.BICUBIC, expand=True), color
+def draw_icon(d, verdict, cx, cy, size, color):
+    lw = max(2, round(size * 0.12))
+    if verdict == "proven":
+        pts = [(cx - 0.22 * size, cy + 0.01 * size), (cx - 0.06 * size, cy + 0.17 * size), (cx + 0.23 * size, cy - 0.15 * size)]
+        d.line(pts, fill=color, width=lw, joint="curve")
+    elif verdict == "promising":
+        r = size * 0.065
+        for dx in (-0.2, 0.0, 0.2):
+            x = cx + dx * size
+            d.ellipse([x - r, cy - r, x + r, cy + r], fill=color)
+    elif verdict == "unproven":
+        d.text((cx, cy + size * 0.02), "?", font=font("bold", size * 0.62), fill=color, anchor="mm")
+    else:
+        a = 0.17 * size
+        d.line([(cx - a, cy - a), (cx + a, cy + a)], fill=color, width=lw)
+        d.line([(cx - a, cy + a), (cx + a, cy - a)], fill=color, width=lw)
 
 
-def apply_stamps(img, stamps):
-    if not stamps:
-        return img
-    layer = Image.new("RGB", img.size, "white")
-    for mask, color, cx, cy in stamps:
-        layer.paste(Image.new("RGB", mask.size, color), (round(cx - mask.width / 2), round(cy - mask.height / 2)), mask)
-    return ImageChops.multiply(img, layer)
+def draw_pill(d, x, y, verdict, k, width=None):
+    label, color, glyph = VERDICTS[verdict]
+    w, h, f, icon = pill_metrics(verdict, k)
+    w = max(w, width or 0)
+    d.rounded_rectangle([x, y, x + w, y + h], radius=h // 2, fill=mix(color, SURFACE, TINT))
+    cx, cy = x + 10 * S * k + icon / 2, y + h / 2
+    d.ellipse([cx - icon / 2, cy - icon / 2, cx + icon / 2, cy + icon / 2], fill=color)
+    draw_icon(d, verdict, cx, cy, icon, glyph)
+    d.text((x + 10 * S * k + icon + 14 * S * k, cy + 1 * S), label, font=f, fill=INK, anchor="lm")
+    return w, h
+
+
+def text_block(text, weight, max_w, max_lines, size, min_size, lh_factor):
+    got = fit(text, weight, max_w, max_lines, size, min_size)
+    if not got:
+        return None
+    f, lines = got
+    lh = round(f.size * lh_factor)
+    return {"font": f, "lines": lines, "lh": lh, "cap": cap(f), "height": cap(f) + (len(lines) - 1) * lh}
+
+
+def draw_block(d, b, x, top, fill):
+    base = top + b["cap"]
+    for i, line in enumerate(b["lines"]):
+        d.text((x, base + i * b["lh"]), line, font=b["font"], fill=fill, anchor="ls")
+
+
+SCALES = [1.0, 0.94, 0.88, 0.82, 0.76, 0.7, 0.64]
+CONTENT_W = W - 2 * PAD
+AVAIL_H = BODY_BOTTOM - BODY_TOP
+
+
+def place(total):
+    """Top of a body block of the given height, sitting in the upper part of the body."""
+    return BODY_TOP + max(0, (AVAIL_H - total) * 0.3)
 
 
 # ---------- card types ----------
 
-# Content starts as large as it can and shrinks until it fits with some air left over.
-SCALES = [1.3, 1.22, 1.14, 1.06, 1.0, 0.94, 0.88, 0.82, 0.76, 0.7, 0.64, 0.58]
-AIR = 0.9
-
-
-def render_number(d, spec, stamps):
-    head_bottom = Y0 + cap(font("head", u(30)))
-    right = X1
-    if spec["verdict"]:
-        mask, color = make_stamp(spec["verdict"], u(58), -7, seed_for(spec["slug"], spec["verdict"]))
-        cx, cy = X1 - mask.width / 2 + u(8), Y0 + mask.height / 2 - u(18)
-        stamps.append((mask, color, cx, cy))
-        right = cx - mask.width / 2 - u(24)
-        head_bottom = max(head_bottom, cy + mask.height / 2 - u(16))
-    draw_kicker(d, spec["kicker"], right)
-    top = head_bottom + u(34)
-    avail = Y1 - top
+def render_number(d, spec):
     for k in SCALES:
-        size = min(u(420) * k, u(520))
-        hf = font("hero", size)
-        while text_w(spec["number"], hf) > CONTENT_W and size > u(150):
-            size -= u(6)
-            hf = font("hero", size)
+        hero_size = 290 * S * k
+        hf = font("hero", hero_size)
+        while text_w(spec["number"], hf) > CONTENT_W and hero_size > 120 * S:
+            hero_size -= 6 * S
+            hf = font("hero", hero_size)
         if text_w(spec["number"], hf) > CONTENT_W:
             raise SpecError('"number" is too wide to fit; shorten it')
         box = hf.getbbox(spec["number"], anchor="ls")
         hero_cap, hero_desc = -box[1], max(0, box[3])
-        hero_gap = u(40) * k + hero_desc
-        label = text_block(spec["label"], "head", CONTENT_W, 3, min(u(64) * k, u(72)), u(40), 1.08)
-        note = text_block(spec["note"], "body", CONTENT_W, 3, min(u(34) * k, u(38)), u(26), 1.28) if spec["note"] else None
+        hero_gap = 46 * S * k + hero_desc
+        label = text_block(spec["label"], "semibold", CONTENT_W, 2, 58 * S * k, 40 * S, 1.17)
+        note = text_block(spec["note"], "regular", CONTENT_W, 3, 36 * S * k, 26 * S, 1.33) if spec["note"] else None
         if label is None or (spec["note"] and note is None):
             continue
-        total = hero_cap + hero_gap + label["height"] + (u(30) * k + note["height"] if note else 0)
-        if total > avail * AIR:
-            continue
-        y = top + (avail - total) * 0.3
-        d.text((X0 - u(4), y + hero_cap), spec["number"], font=hf, fill=INK, anchor="ls")
-        y += hero_cap + hero_gap
-        draw_block(d, label, X0, y, INK)
+        total = hero_cap + hero_gap + label["height"]
         if note:
-            draw_block(d, note, X0, y + label["height"] + u(30) * k, INK_2)
+            total += 38 * S * k + note["height"]
+        pill_h = pill_metrics(spec["verdict"], k)[1] if spec["verdict"] else 0
+        if spec["verdict"]:
+            total += 40 * S * k + pill_h
+        if total > AVAIL_H:
+            continue
+        y = place(total)
+        d.text((PAD - 6 * S * k, y + hero_cap), spec["number"], font=hf, fill=INK, anchor="ls")
+        y += hero_cap + hero_gap
+        draw_block(d, label, PAD, y, INK)
+        y += label["height"]
+        if note:
+            y += 38 * S * k
+            draw_block(d, note, PAD, y, INK_2)
+            y += note["height"]
+        if spec["verdict"]:
+            y += 40 * S * k
+            draw_pill(d, PAD, y, spec["verdict"], k)
         return
     raise SpecError('"label" or "note" is too long to fit; shorten them')
 
 
-def render_bars(d, spec, stamps):
-    bars, n = spec["bars"], len(spec["bars"])
+def render_bars(d, spec):
+    bars = spec["bars"]
+    n = len(bars)
     vmax = max(b["value"] for b in bars)
-    top = draw_kicker(d, spec["kicker"]) + u(40)
-    avail = Y1 - top
     for k in SCALES:
-        title = text_block(spec["title"], "headbold", CONTENT_W, 2, min(u(60) * k, u(68)), u(38), 1.06)
-        sub = text_block(spec["subtitle"], "body", CONTENT_W, 1, min(u(32) * k, u(36)), u(24), 1.25) if spec["subtitle"] else None
-        note = text_block(spec["note"], "body", CONTENT_W, 3, min(u(32) * k, u(36)), u(24), 1.28) if spec["note"] else None
+        title = text_block(spec["title"], "semibold", CONTENT_W, 2, 56 * S * k, 40 * S, 1.17)
+        sub = text_block(spec["subtitle"], "regular", CONTENT_W, 1, 32 * S * k, 24 * S, 1.3) if spec["subtitle"] else None
+        note = text_block(spec["note"], "regular", CONTENT_W, 2, 30 * S * k, 24 * S, 1.33) if spec["note"] else None
         if title is None or (spec["subtitle"] and sub is None) or (spec["note"] and note is None):
             continue
-        lf = font("head", u(34) * k)
-        vf = font("value", u(56) * k)
-        thick = round(u(54) * k)
-        if any(text_w(b["label"], lf) > CONTENT_W for b in bars):
+        row_h = round(min(86 * S * k, (AVAIL_H * 0.62) / n))
+        thick = round(min(44 * S * k, row_h * 0.48))
+        lf = font("medium", min(32 * S * k, row_h * 0.42))
+        vf = font("semibold", min(32 * S * k, row_h * 0.42))
+        label_w = max(text_w(b["label"], lf) for b in bars)
+        if label_w > CONTENT_W * 0.4:
             continue
-        row_h = cap(lf) + u(14) * k + thick + u(34) * k
         value_w = max(text_w(b["display"], vf) for b in bars)
-        max_len = CONTENT_W - value_w - u(22)
-        head_h = title["height"] + (u(18) * k + sub["height"] if sub else 0) + u(52) * k
-        total = head_h + n * row_h - u(34) * k + (u(40) * k + note["height"] if note else 0)
-        if total > avail * AIR or max_len < CONTENT_W * 0.4:
+        base_x = PAD + label_w + 26 * S
+        max_len = W - PAD - base_x - value_w - 22 * S
+        if max_len < CONTENT_W * 0.3:
             continue
-        y = top + (avail - total) * 0.3
-        draw_block(d, title, X0, y, INK)
+        chart_h = row_h * n
+        total = title["height"] + (20 * S * k + sub["height"] if sub else 0) + 48 * S * k + chart_h
+        if note:
+            total += 34 * S * k + note["height"]
+        if total > AVAIL_H:
+            continue
+        y = place(total)
+        draw_block(d, title, PAD, y, INK)
         y += title["height"]
         if sub:
-            y += u(18) * k
-            draw_block(d, sub, X0, y, INK_2)
+            y += 20 * S * k
+            draw_block(d, sub, PAD, y, INK_2)
             y += sub["height"]
-        y += u(52) * k
+        y += 48 * S * k
         chart_top = y
-        radius = u(3)
+        radius = round(min(9 * S, thick / 2))
         for i, b in enumerate(bars):
-            base = y + cap(lf)
-            d.text((X0 + u(18), base), b["label"], font=lf, fill=INK, anchor="ls")
-            bt = base + u(14) * k
-            color = INK if spec["highlight"] is None or spec["highlight"] == i else BAR_SOFT
+            cy = chart_top + i * row_h + row_h / 2
+            color = BLUE if spec["highlight"] is None or spec["highlight"] == i else BLUE_SOFT
             length = 0 if b["value"] <= 0 else max(radius * 2, b["value"] / vmax * max_len)
             if length:
-                d.rounded_rectangle([X0, bt, X0 + length, bt + thick], radius=radius, fill=color,
-                                    corners=(False, True, True, False))
-            d.text((X0 + length + u(16), bt + thick / 2), b["display"], font=vf, fill=INK, anchor="lm")
-            y += row_h
-        d.line([(X0, chart_top - u(6)), (X0, y - u(34) * k + u(6))], fill=INK, width=u(2))
+                d.rounded_rectangle([base_x, cy - thick / 2, base_x + length, cy + thick / 2], radius=radius,
+                                    fill=color, corners=(False, True, True, False))
+            d.text((base_x - 26 * S, cy), b["label"], font=lf, fill=INK, anchor="rm")
+            d.text((base_x + length + 20 * S, cy), b["display"], font=vf, fill=INK, anchor="lm")
+        d.line([(base_x, chart_top + row_h * 0.12), (base_x, chart_top + chart_h - row_h * 0.12)], fill=BASELINE, width=2 * S)
+        y = chart_top + chart_h
         if note:
-            draw_block(d, note, X0, y - u(34) * k + u(40) * k, INK_2)
+            y += 34 * S * k
+            draw_block(d, note, PAD, y, INK_2)
         return
     raise SpecError("the title, labels or note are too long to fit; shorten them")
 
 
-ROW_ANGLES = [-4, 3, -2, 4, -3, 2]
-
-
-def render_scorecard(d, spec, stamps):
+def render_scorecard(d, spec):
     rows = spec["rows"]
-    top = draw_kicker(d, spec["kicker"]) + u(36)
-    avail = Y1 - top
     for k in SCALES:
-        title = text_block(spec["title"], "headbold", CONTENT_W, 2, min(u(58) * k, u(66)), u(38), 1.06)
+        title = text_block(spec["title"], "semibold", CONTENT_W, 2, 54 * S * k, 40 * S, 1.17)
         if title is None:
             continue
-        marks = [make_stamp(r["verdict"], u(30) * k, ROW_ANGLES[i], seed_for(spec["slug"], i, r["verdict"]))
-                 for i, r in enumerate(rows)]
-        col = max(m.width for m, _ in marks)
-        claim_w = CONTENT_W - col - u(30)
-        blocks = [text_block(r["claim"], "medium", claim_w, 3, u(36) * k, u(26), 1.2) for r in rows]
+        pill_w = max(pill_metrics(r["verdict"], k)[0] for r in rows)
+        pill_h = pill_metrics(rows[0]["verdict"], k)[1]
+        text_x_off = pill_w + 30 * S * k
+        claim_w = CONTENT_W - text_x_off
+        blocks = [text_block(r["claim"], "medium", claim_w, 2, 34 * S * k, 26 * S, 1.27) for r in rows]
         if any(b is None for b in blocks):
             continue
-        pad = u(22) * k
-        row_hs = [max(b["height"] + b["font"].size * 0.28, m.height * 0.82) + 2 * pad for b, (m, _) in zip(blocks, marks)]
-        total = title["height"] + u(34) * k + sum(row_hs)
-        if total > avail * AIR:
+        pad_v = 20 * S * k
+        row_hs = [max(pill_h, b["height"] + b["font"].size * 0.3) + 2 * pad_v for b in blocks]
+        total = title["height"] + 40 * S * k + sum(row_hs)
+        if total > AVAIL_H:
             continue
-        y = top + (avail - total) * 0.3
-        draw_block(d, title, X0, y, INK)
-        y += title["height"] + u(34) * k
-        for i, (b, (mask, color), rh) in enumerate(zip(blocks, marks, row_hs)):
-            d.line([(X0, y), (X1, y)], fill=RULE if i else INK, width=u(1.5) if i else u(2))
+        y = place(total)
+        draw_block(d, title, PAD, y, INK)
+        y += title["height"] + 40 * S * k
+        for i, (r, b, rh) in enumerate(zip(rows, blocks, row_hs)):
+            if i:
+                d.line([(PAD, y), (W - PAD, y)], fill=HAIRLINE, width=2 * S)
             mid = y + rh / 2
-            draw_block(d, b, X0, mid - b["height"] / 2, INK)
-            stamps.append((mask, color, X1 - col / 2, mid))
+            draw_pill(d, PAD, mid - pill_h / 2, r["verdict"], k, width=pill_w)
+            draw_block(d, b, PAD + text_x_off, mid - b["height"] / 2, INK)
             y += rh
-        d.line([(X0, y), (X1, y)], fill=INK, width=u(2))
         return
     raise SpecError('the title or a "claim" is too long to fit; shorten it')
 
@@ -566,8 +538,7 @@ def alt_text(spec):
     else:
         parts.append(sentence(spec["title"]))
         parts += [f"{VERDICTS[r['verdict']][0]}: {sentence(r['claim'])}" for r in spec["rows"]]
-    src = spec["source"]
-    parts.append(sentence(src if src.lower().startswith("source") else f"Source: {src}"))
+    parts.append(sentence(source_line(spec["source"])))
     alt = " ".join(parts)
     return alt if len(alt) <= 1000 else alt[:997].rstrip() + "..."
 
@@ -575,14 +546,13 @@ def alt_text(spec):
 # ---------- main ----------
 
 def render(spec):
-    img = Image.new("RGB", (W, H), PAPER)
+    set_theme(spec["theme"])
+    img = Image.new("RGB", (W, H), SURFACE)
     d = ImageDraw.Draw(img)
-    draw_sheet(d)
-    stamps = []
-    {"number": render_number, "bars": render_bars, "scorecard": render_scorecard}[spec["type"]](d, spec, stamps)
-    draw_title_block(d, spec["source"], spec["date"])
-    img = apply_stamps(img, stamps)
-    return img.resize((OUT, OUT), Image.LANCZOS)
+    draw_header(d, spec["kicker"], spec["date"])
+    {"number": render_number, "bars": render_bars, "scorecard": render_scorecard}[spec["type"]](d, spec)
+    draw_footer(d, spec["source"])
+    return img.resize((OUT_W, OUT_H), Image.LANCZOS)
 
 
 def main():
@@ -612,8 +582,9 @@ def main():
         "file": rel,
         "raw_url": f"https://raw.githubusercontent.com/{REPO}/{BRANCH}/{rel}",
         "alt": alt_text(spec),
-        "width": OUT,
-        "height": OUT,
+        "theme": spec["theme"],
+        "width": OUT_W,
+        "height": OUT_H,
         "bytes": os.path.getsize(path),
     }))
 
